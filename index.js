@@ -5,6 +5,7 @@ const axios = require('axios');
 const app = express();
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const DISCORD_DEPLOYMENTS_WEBHOOK_URL = process.env.DISCORD_DEPLOYMENTS_WEBHOOK_URL;
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 
 // Map GitHub usernames → Discord user IDs
@@ -25,6 +26,20 @@ const GITHUB_TO_DISCORD = buildDiscordMap();
 function getMention(githubUsername) {
   const id = GITHUB_TO_DISCORD[githubUsername];
   return id ? `<@${id}>` : `\`${githubUsername}\``;
+}
+
+function truncate(str, max = 300) {
+  if (!str) return '_No description provided._';
+  return str.length > max ? str.slice(0, max) + '…' : str;
+}
+
+function diffStats(pr) {
+  return `\`+${pr.additions}\` \`-${pr.deletions}\` · 📁 ${pr.changed_files} file${pr.changed_files === 1 ? '' : 's'}`;
+}
+
+function labelList(pr) {
+  if (!pr.labels?.length) return null;
+  return pr.labels.map((l) => `\`${l.name}\``).join(' ');
 }
 
 // Preserve raw body for signature verification
@@ -50,32 +65,97 @@ function verifySignature(req) {
   }
 }
 
-async function sendDiscord(content, embeds = []) {
-  await axios.post(DISCORD_WEBHOOK_URL, { content, embeds });
+async function sendDiscord(webhookUrl, content, embeds = []) {
+  await axios.post(webhookUrl, { content, embeds });
 }
 
 // ── Event handlers ──────────────────────────────────────────────────────────
 
 async function handlePullRequest(payload) {
   const { action, pull_request: pr, sender } = payload;
-  const prLink = `[#${pr.number} ${pr.title}](${pr.html_url})`;
   const actor = getMention(sender.login);
+  const fields = [];
 
   if (action === 'opened') {
-    await sendDiscord(`${actor} opened PR ${prLink}`, [
+    fields.push({ name: 'Changes', value: diffStats(pr), inline: true });
+    const labels = labelList(pr);
+    if (labels) fields.push({ name: 'Labels', value: labels, inline: true });
+    if (pr.milestone) fields.push({ name: 'Milestone', value: pr.milestone.title, inline: true });
+    fields.push({ name: 'Branch', value: `\`${pr.head.ref}\` → \`${pr.base.ref}\``, inline: false });
+
+    await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} opened a pull request`, [
       {
-        description: pr.body || '_No description provided._',
+        author: {
+          name: sender.login,
+          icon_url: sender.avatar_url,
+          url: `https://github.com/${sender.login}`,
+        },
+        title: `#${pr.number} ${pr.title}`,
+        url: pr.html_url,
+        description: truncate(pr.body),
         color: 0x2ecc71,
+        fields,
+        timestamp: new Date().toISOString(),
       },
     ]);
   } else if (action === 'closed') {
     if (pr.merged) {
-      await sendDiscord(`${actor} merged PR ${prLink} 🎉`, [
-        { color: 0x9b59b6 },
-      ]);
+      fields.push({ name: 'Changes', value: diffStats(pr), inline: true });
+      const labels = labelList(pr);
+      if (labels) fields.push({ name: 'Labels', value: labels, inline: true });
+      if (pr.milestone) fields.push({ name: 'Milestone', value: pr.milestone.title, inline: true });
+
+      const prEmbed = {
+        author: {
+          name: sender.login,
+          icon_url: sender.avatar_url,
+          url: `https://github.com/${sender.login}`,
+        },
+        title: `#${pr.number} ${pr.title}`,
+        url: pr.html_url,
+        color: 0x9b59b6,
+        fields,
+        timestamp: new Date().toISOString(),
+      };
+
+      // Post to PR channel
+      await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} merged a pull request`, [prEmbed]);
+
+      // Post to deployments channel if merged into main
+      if (pr.base.ref === 'main' && DISCORD_DEPLOYMENTS_WEBHOOK_URL) {
+        await sendDiscord(
+          DISCORD_DEPLOYMENTS_WEBHOOK_URL,
+          `🚀 **Deployed to main**`,
+          [
+            {
+              author: {
+                name: `Merged by ${sender.login}`,
+                icon_url: sender.avatar_url,
+                url: `https://github.com/${sender.login}`,
+              },
+              title: `#${pr.number} ${pr.title}`,
+              url: pr.html_url,
+              description: truncate(pr.body),
+              color: 0x9b59b6,
+              fields,
+              timestamp: new Date().toISOString(),
+            },
+          ]
+        );
+      }
     } else {
-      await sendDiscord(`${actor} closed PR ${prLink} without merging`, [
-        { color: 0xe74c3c },
+      await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} closed a pull request without merging`, [
+        {
+          author: {
+            name: sender.login,
+            icon_url: sender.avatar_url,
+            url: `https://github.com/${sender.login}`,
+          },
+          title: `#${pr.number} ${pr.title}`,
+          url: pr.html_url,
+          color: 0xe74c3c,
+          timestamp: new Date().toISOString(),
+        },
       ]);
     }
   } else if (action === 'review_requested') {
@@ -83,7 +163,21 @@ async function handlePullRequest(payload) {
     if (reviewer) {
       const reviewerMention = getMention(reviewer);
       await sendDiscord(
-        `${actor} requested a review from ${reviewerMention} on PR ${prLink}`
+        DISCORD_WEBHOOK_URL,
+        `${actor} requested a review from ${reviewerMention}`,
+        [
+          {
+            author: {
+              name: sender.login,
+              icon_url: sender.avatar_url,
+              url: `https://github.com/${sender.login}`,
+            },
+            title: `#${pr.number} ${pr.title}`,
+            url: pr.html_url,
+            color: 0xf1c40f,
+            timestamp: new Date().toISOString(),
+          },
+        ]
       );
     }
   }
@@ -93,31 +187,65 @@ async function handlePullRequestReview(payload) {
   const { action, review, pull_request: pr, sender } = payload;
   if (action !== 'submitted') return;
 
-  const prLink = `[#${pr.number} ${pr.title}](${pr.html_url})`;
   const reviewer = getMention(sender.login);
   const prAuthor = getMention(pr.user.login);
 
   if (review.state === 'approved') {
     await sendDiscord(
-      `${reviewer} approved ${prAuthor}'s PR ${prLink} ✅`
+      DISCORD_WEBHOOK_URL,
+      `${reviewer} approved ${prAuthor}'s pull request`,
+      [
+        {
+          author: {
+            name: sender.login,
+            icon_url: sender.avatar_url,
+            url: `https://github.com/${sender.login}`,
+          },
+          title: `#${pr.number} ${pr.title} ✅`,
+          url: pr.html_url,
+          color: 0x2ecc71,
+          timestamp: new Date().toISOString(),
+        },
+      ]
     );
   } else if (review.state === 'changes_requested') {
     await sendDiscord(
-      `${reviewer} requested changes on ${prAuthor}'s PR ${prLink} 🔄`,
+      DISCORD_WEBHOOK_URL,
+      `${reviewer} requested changes on ${prAuthor}'s pull request`,
       [
         {
-          description: review.body || '_No comment left._',
+          author: {
+            name: sender.login,
+            icon_url: sender.avatar_url,
+            url: `https://github.com/${sender.login}`,
+          },
+          title: `#${pr.number} ${pr.title} 🔄`,
+          url: pr.html_url,
+          description: truncate(review.body),
           color: 0xe67e22,
+          timestamp: new Date().toISOString(),
         },
       ]
     );
   } else if (review.state === 'commented' && review.body) {
-    await sendDiscord(`${reviewer} left a review on PR ${prLink}`, [
-      {
-        description: review.body,
-        color: 0x3498db,
-      },
-    ]);
+    await sendDiscord(
+      DISCORD_WEBHOOK_URL,
+      `${reviewer} left a review on ${prAuthor}'s pull request`,
+      [
+        {
+          author: {
+            name: sender.login,
+            icon_url: sender.avatar_url,
+            url: `https://github.com/${sender.login}`,
+          },
+          title: `#${pr.number} ${pr.title}`,
+          url: pr.html_url,
+          description: truncate(review.body),
+          color: 0x3498db,
+          timestamp: new Date().toISOString(),
+        },
+      ]
+    );
   }
 }
 
@@ -125,14 +253,20 @@ async function handleReviewComment(payload) {
   const { action, comment, pull_request: pr, sender } = payload;
   if (action !== 'created') return;
 
-  const prLink = `[#${pr.number} ${pr.title}](${pr.html_url})`;
   const commenter = getMention(sender.login);
 
-  await sendDiscord(`${commenter} commented on PR ${prLink}`, [
+  await sendDiscord(DISCORD_WEBHOOK_URL, `${commenter} commented on a pull request`, [
     {
-      description: comment.body,
-      color: 0x3498db,
+      author: {
+        name: sender.login,
+        icon_url: sender.avatar_url,
+        url: `https://github.com/${sender.login}`,
+      },
+      title: `#${pr.number} ${pr.title}`,
       url: comment.html_url,
+      description: truncate(comment.body),
+      color: 0x3498db,
+      timestamp: new Date().toISOString(),
     },
   ]);
 }
@@ -141,14 +275,20 @@ async function handleIssueComment(payload) {
   const { action, comment, issue, sender } = payload;
   if (action !== 'created') return;
 
-  const prLink = `[#${issue.number} ${issue.title}](${issue.html_url})`;
   const commenter = getMention(sender.login);
 
-  await sendDiscord(`${commenter} commented on PR ${prLink}`, [
+  await sendDiscord(DISCORD_WEBHOOK_URL, `${commenter} commented on a pull request`, [
     {
-      description: comment.body,
-      color: 0x3498db,
+      author: {
+        name: sender.login,
+        icon_url: sender.avatar_url,
+        url: `https://github.com/${sender.login}`,
+      },
+      title: `#${issue.number} ${issue.title}`,
       url: comment.html_url,
+      description: truncate(comment.body),
+      color: 0x3498db,
+      timestamp: new Date().toISOString(),
     },
   ]);
 }
