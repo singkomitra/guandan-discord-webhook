@@ -6,6 +6,7 @@ const app = express();
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const DISCORD_DEPLOYMENTS_WEBHOOK_URL = process.env.DISCORD_DEPLOYMENTS_WEBHOOK_URL;
+const DISCORD_ISSUES_WEBHOOK_URL = process.env.DISCORD_ISSUES_WEBHOOK_URL;
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 
 // Map GitHub usernames → Discord user IDs
@@ -293,6 +294,32 @@ async function handleIssueComment(payload) {
   ]);
 }
 
+async function handleIssue(payload) {
+  const { action, issue, assignee, sender } = payload;
+  if (action !== 'assigned' || !assignee) return;
+
+  const assigneeMention = getMention(assignee.login);
+  const actor = getMention(sender.login);
+
+  await sendDiscord(DISCORD_ISSUES_WEBHOOK_URL, `${actor} assigned ${assigneeMention} to an issue`, [
+    {
+      author: {
+        name: sender.login,
+        icon_url: sender.avatar_url,
+        url: `https://github.com/${sender.login}`,
+      },
+      title: `#${issue.number} ${issue.title}`,
+      url: issue.html_url,
+      description: truncate(issue.body),
+      color: 0xe67e22,
+      fields: labelList(issue)
+        ? [{ name: 'Labels', value: labelList(issue), inline: true }]
+        : [],
+      timestamp: new Date().toISOString(),
+    },
+  ]);
+}
+
 // ── Route ───────────────────────────────────────────────────────────────────
 
 app.post('/github', async (req, res) => {
@@ -305,7 +332,9 @@ app.post('/github', async (req, res) => {
   const payload = req.body;
 
   try {
-    if (event === 'pull_request') {
+    if (event === 'issues') {
+      await handleIssue(payload);
+    } else if (event === 'pull_request') {
       await handlePullRequest(payload);
     } else if (event === 'pull_request_review') {
       await handlePullRequestReview(payload);
