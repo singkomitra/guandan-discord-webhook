@@ -379,26 +379,30 @@ app.post('/github', async (req, res) => {
 
   const payload = req.body;
 
-  try {
-    if (event === 'issues') {
-      await handleIssue(payload);
-    } else if (event === 'pull_request') {
-      await handlePullRequest(payload);
-    } else if (event === 'pull_request_review') {
-      await handlePullRequestReview(payload);
-    } else if (event === 'pull_request_review_comment') {
-      await handleReviewComment(payload);
-    } else if (event === 'issue_comment' && payload.issue?.pull_request) {
-      await handleIssueComment(payload);
-    } else {
-      console.log(`[webhook] No handler for event="${event}" action="${action}" — ignoring`);
+  // Respond to GitHub immediately so it doesn't time out or retry
+  res.status(200).send('OK');
+
+  // Process asynchronously in the background
+  (async () => {
+    try {
+      if (event === 'issues') {
+        await handleIssue(payload);
+      } else if (event === 'pull_request') {
+        await handlePullRequest(payload);
+      } else if (event === 'pull_request_review') {
+        await handlePullRequestReview(payload);
+      } else if (event === 'pull_request_review_comment') {
+        await handleReviewComment(payload);
+      } else if (event === 'issue_comment' && payload.issue?.pull_request) {
+        await handleIssueComment(payload);
+      } else {
+        console.log(`[webhook] No handler for event="${event}" action="${action}" — ignoring`);
+      }
+    } catch (err) {
+      console.error(`[webhook] Error handling event="${event}" action="${action}": ${err.message}`);
+      if (err.response?.data) console.error(`[webhook] Response body: ${JSON.stringify(err.response.data)}`);
     }
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error(`[webhook] Error handling event="${event}" action="${action}": ${err.message}`);
-    if (err.response?.data) console.error(`[webhook] Response body: ${JSON.stringify(err.response.data)}`);
-    res.status(500).send('Internal error');
-  }
+  })();
 });
 
 app.get('/', (_req, res) => res.send('Guandan webhook server running.'));
