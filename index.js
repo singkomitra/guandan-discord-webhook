@@ -81,7 +81,7 @@ function verifySignature(req) {
   }
 }
 
-async function sendDiscord(channelId, channelLabel, content, embeds = [], retries = 3) {
+async function sendDiscord(channelId, channelLabel, content, embeds = []) {
   if (!channelId) {
     console.warn(`[discord] Skipping send to ${channelLabel} — channel ID not configured`);
     return;
@@ -93,14 +93,32 @@ async function sendDiscord(channelId, channelLabel, content, embeds = [], retrie
       { content, embeds },
       { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
     );
-    console.log(`[discord] ${channelLabel} responded ${res.status}`);
+    const remaining = res.headers['x-ratelimit-remaining'];
+    const resetAfter = res.headers['x-ratelimit-reset-after'];
+    console.log(`[discord] ${channelLabel} responded ${res.status} (rate limit remaining: ${remaining}, resets in: ${resetAfter}s)`);
   } catch (err) {
-    if (err.response?.status === 429 && retries > 0) {
+    if (err.response?.status === 429) {
+      const isCloudflare = err.response.data?.cloudflare_error === true;
+      if (isCloudflare) {
+        // Do NOT retry — retrying Cloudflare blocks counts toward the threshold and makes it worse
+        console.error(`[discord] Cloudflare IP block on ${channelLabel} — not retrying. Ban is transient, will lift automatically.`);
+        return;
+      }
+      // Discord's own rate limit — wait and retry once
       const retryAfter = (err.response.data?.retry_after ?? 1) * 1000;
-      console.warn(`[discord] Rate limited on ${channelLabel} — full response: ${JSON.stringify(err.response.data)}`);
-      console.warn(`[discord] Retrying in ${retryAfter}ms... (${retries} retries left)`);
+      console.warn(`[discord] Discord rate limit on ${channelLabel}, retrying once in ${retryAfter}ms`);
       await new Promise((r) => setTimeout(r, retryAfter));
-      return sendDiscord(channelId, channelLabel, content, embeds, retries - 1);
+      try {
+        await axios.post(
+          `https://discord.com/api/v10/channels/${channelId}/messages`,
+          { content, embeds },
+          { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+        );
+        console.log(`[discord] ${channelLabel} retry succeeded`);
+      } catch (retryErr) {
+        console.error(`[discord] Retry failed for ${channelLabel}: ${retryErr.response?.status} ${JSON.stringify(retryErr.response?.data)}`);
+      }
+      return;
     }
     console.error(`[discord] Failed to send to ${channelLabel}: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
     throw err;
