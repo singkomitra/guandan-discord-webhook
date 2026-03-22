@@ -18,14 +18,21 @@ function buildDiscordMap() {
     if (key.startsWith('DISCORD_ID_')) {
       const githubUsername = key.replace('DISCORD_ID_', '').toLowerCase();
       map[githubUsername] = val;
+      console.log(`[config] Mapped GitHub user "${githubUsername}" to Discord ID "${val}"`);
     }
   }
   return map;
 }
 const GITHUB_TO_DISCORD = buildDiscordMap();
 
+console.log(`[config] DISCORD_WEBHOOK_URL set: ${!!DISCORD_WEBHOOK_URL}`);
+console.log(`[config] DISCORD_DEPLOYMENTS_WEBHOOK_URL set: ${!!DISCORD_DEPLOYMENTS_WEBHOOK_URL}`);
+console.log(`[config] DISCORD_ISSUES_WEBHOOK_URL set: ${!!DISCORD_ISSUES_WEBHOOK_URL}`);
+console.log(`[config] GITHUB_WEBHOOK_SECRET set: ${!!GITHUB_WEBHOOK_SECRET}`);
+
 function getMention(githubUsername) {
   const id = GITHUB_TO_DISCORD[githubUsername];
+  if (!id) console.warn(`[mention] No Discord ID mapped for GitHub user "${githubUsername}"`);
   return id ? `<@${id}>` : `\`${githubUsername}\``;
 }
 
@@ -53,9 +60,15 @@ app.use(
 );
 
 function verifySignature(req) {
-  if (!GITHUB_WEBHOOK_SECRET) return true;
+  if (!GITHUB_WEBHOOK_SECRET) {
+    console.warn('[auth] No webhook secret set — skipping signature check');
+    return true;
+  }
   const sig = req.headers['x-hub-signature-256'];
-  if (!sig) return false;
+  if (!sig) {
+    console.warn('[auth] Request missing x-hub-signature-256 header');
+    return false;
+  }
   const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
   hmac.update(req.rawBody);
   const digest = 'sha256=' + hmac.digest('hex');
@@ -66,14 +79,32 @@ function verifySignature(req) {
   }
 }
 
-async function sendDiscord(webhookUrl, content, embeds = []) {
-  await axios.post(webhookUrl, { content, embeds });
+async function sendDiscord(webhookUrl, channelLabel, content, embeds = [], retries = 3) {
+  if (!webhookUrl) {
+    console.warn(`[discord] Skipping send to ${channelLabel} — webhook URL not configured`);
+    return;
+  }
+  console.log(`[discord] Sending to ${channelLabel}: "${content}"`);
+  try {
+    const res = await axios.post(webhookUrl, { content, embeds });
+    console.log(`[discord] ${channelLabel} responded ${res.status}`);
+  } catch (err) {
+    if (err.response?.status === 429 && retries > 0) {
+      const retryAfter = (err.response.data?.retry_after ?? 1) * 1000;
+      console.warn(`[discord] Rate limited by ${channelLabel}, retrying in ${retryAfter}ms... (${retries} retries left)`);
+      await new Promise((r) => setTimeout(r, retryAfter));
+      return sendDiscord(webhookUrl, channelLabel, content, embeds, retries - 1);
+    }
+    console.error(`[discord] Failed to send to ${channelLabel}: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
+    throw err;
+  }
 }
 
 // ── Event handlers ──────────────────────────────────────────────────────────
 
 async function handlePullRequest(payload) {
   const { action, pull_request: pr, sender } = payload;
+  console.log(`[pr] action="${action}" pr=#${pr.number} sender=${sender.login}`);
   const actor = getMention(sender.login);
   const fields = [];
 
@@ -84,7 +115,7 @@ async function handlePullRequest(payload) {
     if (pr.milestone) fields.push({ name: 'Milestone', value: pr.milestone.title, inline: true });
     fields.push({ name: 'Branch', value: `\`${pr.head.ref}\` → \`${pr.base.ref}\``, inline: false });
 
-    await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} opened a pull request`, [
+    await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} opened a pull request`, [
       {
         author: {
           name: sender.login,
@@ -119,13 +150,13 @@ async function handlePullRequest(payload) {
         timestamp: new Date().toISOString(),
       };
 
-      // Post to PR channel
-      await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} merged a pull request`, [prEmbed]);
+      await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} merged a pull request`, [prEmbed]);
 
-      // Post to deployments channel if merged into main
-      if (pr.base.ref === 'main' && DISCORD_DEPLOYMENTS_WEBHOOK_URL) {
+      if (pr.base.ref === 'main') {
+        console.log(`[pr] Merged into main — posting to #deployments`);
         await sendDiscord(
           DISCORD_DEPLOYMENTS_WEBHOOK_URL,
+          '#deployments',
           `🚀 **Deployed to main**`,
           [
             {
@@ -143,9 +174,11 @@ async function handlePullRequest(payload) {
             },
           ]
         );
+      } else {
+        console.log(`[pr] Merged into "${pr.base.ref}" (not main) — skipping #deployments`);
       }
     } else {
-      await sendDiscord(DISCORD_WEBHOOK_URL, `${actor} closed a pull request without merging`, [
+      await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} closed a pull request without merging`, [
         {
           author: {
             name: sender.login,
@@ -165,6 +198,7 @@ async function handlePullRequest(payload) {
       const reviewerMention = getMention(reviewer);
       await sendDiscord(
         DISCORD_WEBHOOK_URL,
+        '#pull-requests',
         `${actor} requested a review from ${reviewerMention}`,
         [
           {
@@ -181,11 +215,14 @@ async function handlePullRequest(payload) {
         ]
       );
     }
+  } else {
+    console.log(`[pr] Ignoring unhandled action "${action}"`);
   }
 }
 
 async function handlePullRequestReview(payload) {
   const { action, review, pull_request: pr, sender } = payload;
+  console.log(`[review] action="${action}" state="${review.state}" pr=#${pr.number} sender=${sender.login}`);
   if (action !== 'submitted') return;
 
   const reviewer = getMention(sender.login);
@@ -194,6 +231,7 @@ async function handlePullRequestReview(payload) {
   if (review.state === 'approved') {
     await sendDiscord(
       DISCORD_WEBHOOK_URL,
+      '#pull-requests',
       `${reviewer} approved ${prAuthor}'s pull request`,
       [
         {
@@ -212,6 +250,7 @@ async function handlePullRequestReview(payload) {
   } else if (review.state === 'changes_requested') {
     await sendDiscord(
       DISCORD_WEBHOOK_URL,
+      '#pull-requests',
       `${reviewer} requested changes on ${prAuthor}'s pull request`,
       [
         {
@@ -231,6 +270,7 @@ async function handlePullRequestReview(payload) {
   } else if (review.state === 'commented' && review.body) {
     await sendDiscord(
       DISCORD_WEBHOOK_URL,
+      '#pull-requests',
       `${reviewer} left a review on ${prAuthor}'s pull request`,
       [
         {
@@ -247,16 +287,19 @@ async function handlePullRequestReview(payload) {
         },
       ]
     );
+  } else {
+    console.log(`[review] Ignoring state "${review.state}" (no body or unhandled)`);
   }
 }
 
 async function handleReviewComment(payload) {
   const { action, comment, pull_request: pr, sender } = payload;
+  console.log(`[review-comment] action="${action}" pr=#${pr.number} sender=${sender.login}`);
   if (action !== 'created') return;
 
   const commenter = getMention(sender.login);
 
-  await sendDiscord(DISCORD_WEBHOOK_URL, `${commenter} commented on a pull request`, [
+  await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${commenter} commented on a pull request`, [
     {
       author: {
         name: sender.login,
@@ -274,11 +317,12 @@ async function handleReviewComment(payload) {
 
 async function handleIssueComment(payload) {
   const { action, comment, issue, sender } = payload;
+  console.log(`[issue-comment] action="${action}" issue=#${issue.number} sender=${sender.login}`);
   if (action !== 'created') return;
 
   const commenter = getMention(sender.login);
 
-  await sendDiscord(DISCORD_WEBHOOK_URL, `${commenter} commented on a pull request`, [
+  await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${commenter} commented on a pull request`, [
     {
       author: {
         name: sender.login,
@@ -296,12 +340,13 @@ async function handleIssueComment(payload) {
 
 async function handleIssue(payload) {
   const { action, issue, assignee, sender } = payload;
+  console.log(`[issue] action="${action}" issue=#${issue.number} sender=${sender.login} assignee=${assignee?.login ?? 'none'}`);
   if (action !== 'assigned' || !assignee) return;
 
   const assigneeMention = getMention(assignee.login);
   const actor = getMention(sender.login);
 
-  await sendDiscord(DISCORD_ISSUES_WEBHOOK_URL, `${actor} assigned ${assigneeMention} to an issue`, [
+  await sendDiscord(DISCORD_ISSUES_WEBHOOK_URL, '#issues', `${actor} assigned ${assigneeMention} to an issue`, [
     {
       author: {
         name: sender.login,
@@ -324,11 +369,14 @@ async function handleIssue(payload) {
 
 app.post('/github', async (req, res) => {
   if (!verifySignature(req)) {
-    console.warn('Invalid signature');
+    console.warn('[auth] Signature verification failed — rejecting request');
     return res.status(401).send('Unauthorized');
   }
 
   const event = req.headers['x-github-event'];
+  const action = req.body?.action;
+  console.log(`[webhook] Received event="${event}" action="${action}"`);
+
   const payload = req.body;
 
   try {
@@ -342,10 +390,13 @@ app.post('/github', async (req, res) => {
       await handleReviewComment(payload);
     } else if (event === 'issue_comment' && payload.issue?.pull_request) {
       await handleIssueComment(payload);
+    } else {
+      console.log(`[webhook] No handler for event="${event}" action="${action}" — ignoring`);
     }
     res.status(200).send('OK');
   } catch (err) {
-    console.error('Error handling event:', err.message);
+    console.error(`[webhook] Error handling event="${event}" action="${action}": ${err.message}`);
+    if (err.response?.data) console.error(`[webhook] Response body: ${JSON.stringify(err.response.data)}`);
     res.status(500).send('Internal error');
   }
 });
@@ -353,4 +404,4 @@ app.post('/github', async (req, res) => {
 app.get('/', (_req, res) => res.send('Guandan webhook server running.'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`[server] Listening on port ${PORT}`));
