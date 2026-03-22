@@ -4,9 +4,10 @@ const axios = require('axios');
 
 const app = express();
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const DISCORD_DEPLOYMENTS_WEBHOOK_URL = process.env.DISCORD_DEPLOYMENTS_WEBHOOK_URL;
-const DISCORD_ISSUES_WEBHOOK_URL = process.env.DISCORD_ISSUES_WEBHOOK_URL;
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_PR_CHANNEL_ID = process.env.DISCORD_PR_CHANNEL_ID;
+const DISCORD_DEPLOYMENTS_CHANNEL_ID = process.env.DISCORD_DEPLOYMENTS_CHANNEL_ID;
+const DISCORD_ISSUES_CHANNEL_ID = process.env.DISCORD_ISSUES_CHANNEL_ID;
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 
 // Map GitHub usernames → Discord user IDs
@@ -25,9 +26,10 @@ function buildDiscordMap() {
 }
 const GITHUB_TO_DISCORD = buildDiscordMap();
 
-console.log(`[config] DISCORD_WEBHOOK_URL set: ${!!DISCORD_WEBHOOK_URL}`);
-console.log(`[config] DISCORD_DEPLOYMENTS_WEBHOOK_URL set: ${!!DISCORD_DEPLOYMENTS_WEBHOOK_URL}`);
-console.log(`[config] DISCORD_ISSUES_WEBHOOK_URL set: ${!!DISCORD_ISSUES_WEBHOOK_URL}`);
+console.log(`[config] DISCORD_BOT_TOKEN set: ${!!DISCORD_BOT_TOKEN}`);
+console.log(`[config] DISCORD_PR_CHANNEL_ID: ${DISCORD_PR_CHANNEL_ID}`);
+console.log(`[config] DISCORD_DEPLOYMENTS_CHANNEL_ID: ${DISCORD_DEPLOYMENTS_CHANNEL_ID}`);
+console.log(`[config] DISCORD_ISSUES_CHANNEL_ID: ${DISCORD_ISSUES_CHANNEL_ID}`);
 console.log(`[config] GITHUB_WEBHOOK_SECRET set: ${!!GITHUB_WEBHOOK_SECRET}`);
 
 function getMention(githubUsername) {
@@ -79,22 +81,26 @@ function verifySignature(req) {
   }
 }
 
-async function sendDiscord(webhookUrl, channelLabel, content, embeds = [], retries = 3) {
-  if (!webhookUrl) {
-    console.warn(`[discord] Skipping send to ${channelLabel} — webhook URL not configured`);
+async function sendDiscord(channelId, channelLabel, content, embeds = [], retries = 3) {
+  if (!channelId) {
+    console.warn(`[discord] Skipping send to ${channelLabel} — channel ID not configured`);
     return;
   }
   console.log(`[discord] Sending to ${channelLabel}: "${content}"`);
   try {
-    const res = await axios.post(webhookUrl, { content, embeds });
+    const res = await axios.post(
+      `https://discord.com/api/v10/channels/${channelId}/messages`,
+      { content, embeds },
+      { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' } }
+    );
     console.log(`[discord] ${channelLabel} responded ${res.status}`);
   } catch (err) {
     if (err.response?.status === 429 && retries > 0) {
       const retryAfter = (err.response.data?.retry_after ?? 1) * 1000;
-      console.warn(`[discord] Rate limited by ${channelLabel} — full response: ${JSON.stringify(err.response.data)}`);
+      console.warn(`[discord] Rate limited on ${channelLabel} — full response: ${JSON.stringify(err.response.data)}`);
       console.warn(`[discord] Retrying in ${retryAfter}ms... (${retries} retries left)`);
       await new Promise((r) => setTimeout(r, retryAfter));
-      return sendDiscord(webhookUrl, channelLabel, content, embeds, retries - 1);
+      return sendDiscord(channelId, channelLabel, content, embeds, retries - 1);
     }
     console.error(`[discord] Failed to send to ${channelLabel}: ${err.response?.status} ${JSON.stringify(err.response?.data)}`);
     throw err;
@@ -116,13 +122,9 @@ async function handlePullRequest(payload) {
     if (pr.milestone) fields.push({ name: 'Milestone', value: pr.milestone.title, inline: true });
     fields.push({ name: 'Branch', value: `\`${pr.head.ref}\` → \`${pr.base.ref}\``, inline: false });
 
-    await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} opened a pull request`, [
+    await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${actor} opened a pull request`, [
       {
-        author: {
-          name: sender.login,
-          icon_url: sender.avatar_url,
-          url: `https://github.com/${sender.login}`,
-        },
+        author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
         title: `#${pr.number} ${pr.title}`,
         url: pr.html_url,
         description: truncate(pr.body),
@@ -139,11 +141,7 @@ async function handlePullRequest(payload) {
       if (pr.milestone) fields.push({ name: 'Milestone', value: pr.milestone.title, inline: true });
 
       const prEmbed = {
-        author: {
-          name: sender.login,
-          icon_url: sender.avatar_url,
-          url: `https://github.com/${sender.login}`,
-        },
+        author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
         title: `#${pr.number} ${pr.title}`,
         url: pr.html_url,
         color: 0x9b59b6,
@@ -151,41 +149,28 @@ async function handlePullRequest(payload) {
         timestamp: new Date().toISOString(),
       };
 
-      await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} merged a pull request`, [prEmbed]);
+      await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${actor} merged a pull request`, [prEmbed]);
 
       if (pr.base.ref === 'main') {
         console.log(`[pr] Merged into main — posting to #deployments`);
-        await sendDiscord(
-          DISCORD_DEPLOYMENTS_WEBHOOK_URL,
-          '#deployments',
-          `🚀 **Deployed to main**`,
-          [
-            {
-              author: {
-                name: `Merged by ${sender.login}`,
-                icon_url: sender.avatar_url,
-                url: `https://github.com/${sender.login}`,
-              },
-              title: `#${pr.number} ${pr.title}`,
-              url: pr.html_url,
-              description: truncate(pr.body),
-              color: 0x9b59b6,
-              fields,
-              timestamp: new Date().toISOString(),
-            },
-          ]
-        );
+        await sendDiscord(DISCORD_DEPLOYMENTS_CHANNEL_ID, '#deployments', `🚀 **Deployed to main**`, [
+          {
+            author: { name: `Merged by ${sender.login}`, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
+            title: `#${pr.number} ${pr.title}`,
+            url: pr.html_url,
+            description: truncate(pr.body),
+            color: 0x9b59b6,
+            fields,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
       } else {
         console.log(`[pr] Merged into "${pr.base.ref}" (not main) — skipping #deployments`);
       }
     } else {
-      await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${actor} closed a pull request without merging`, [
+      await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${actor} closed a pull request without merging`, [
         {
-          author: {
-            name: sender.login,
-            icon_url: sender.avatar_url,
-            url: `https://github.com/${sender.login}`,
-          },
+          author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
           title: `#${pr.number} ${pr.title}`,
           url: pr.html_url,
           color: 0xe74c3c,
@@ -197,24 +182,15 @@ async function handlePullRequest(payload) {
     const reviewer = payload.requested_reviewer?.login;
     if (reviewer) {
       const reviewerMention = getMention(reviewer);
-      await sendDiscord(
-        DISCORD_WEBHOOK_URL,
-        '#pull-requests',
-        `${actor} requested a review from ${reviewerMention}`,
-        [
-          {
-            author: {
-              name: sender.login,
-              icon_url: sender.avatar_url,
-              url: `https://github.com/${sender.login}`,
-            },
-            title: `#${pr.number} ${pr.title}`,
-            url: pr.html_url,
-            color: 0xf1c40f,
-            timestamp: new Date().toISOString(),
-          },
-        ]
-      );
+      await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${actor} requested a review from ${reviewerMention}`, [
+        {
+          author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
+          title: `#${pr.number} ${pr.title}`,
+          url: pr.html_url,
+          color: 0xf1c40f,
+          timestamp: new Date().toISOString(),
+        },
+      ]);
     }
   } else {
     console.log(`[pr] Ignoring unhandled action "${action}"`);
@@ -230,64 +206,37 @@ async function handlePullRequestReview(payload) {
   const prAuthor = getMention(pr.user.login);
 
   if (review.state === 'approved') {
-    await sendDiscord(
-      DISCORD_WEBHOOK_URL,
-      '#pull-requests',
-      `${reviewer} approved ${prAuthor}'s pull request`,
-      [
-        {
-          author: {
-            name: sender.login,
-            icon_url: sender.avatar_url,
-            url: `https://github.com/${sender.login}`,
-          },
-          title: `#${pr.number} ${pr.title} ✅`,
-          url: pr.html_url,
-          color: 0x2ecc71,
-          timestamp: new Date().toISOString(),
-        },
-      ]
-    );
+    await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${reviewer} approved ${prAuthor}'s pull request`, [
+      {
+        author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
+        title: `#${pr.number} ${pr.title} ✅`,
+        url: pr.html_url,
+        color: 0x2ecc71,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
   } else if (review.state === 'changes_requested') {
-    await sendDiscord(
-      DISCORD_WEBHOOK_URL,
-      '#pull-requests',
-      `${reviewer} requested changes on ${prAuthor}'s pull request`,
-      [
-        {
-          author: {
-            name: sender.login,
-            icon_url: sender.avatar_url,
-            url: `https://github.com/${sender.login}`,
-          },
-          title: `#${pr.number} ${pr.title} 🔄`,
-          url: pr.html_url,
-          description: truncate(review.body),
-          color: 0xe67e22,
-          timestamp: new Date().toISOString(),
-        },
-      ]
-    );
+    await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${reviewer} requested changes on ${prAuthor}'s pull request`, [
+      {
+        author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
+        title: `#${pr.number} ${pr.title} 🔄`,
+        url: pr.html_url,
+        description: truncate(review.body),
+        color: 0xe67e22,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
   } else if (review.state === 'commented' && review.body) {
-    await sendDiscord(
-      DISCORD_WEBHOOK_URL,
-      '#pull-requests',
-      `${reviewer} left a review on ${prAuthor}'s pull request`,
-      [
-        {
-          author: {
-            name: sender.login,
-            icon_url: sender.avatar_url,
-            url: `https://github.com/${sender.login}`,
-          },
-          title: `#${pr.number} ${pr.title}`,
-          url: pr.html_url,
-          description: truncate(review.body),
-          color: 0x3498db,
-          timestamp: new Date().toISOString(),
-        },
-      ]
-    );
+    await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${reviewer} left a review on ${prAuthor}'s pull request`, [
+      {
+        author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
+        title: `#${pr.number} ${pr.title}`,
+        url: pr.html_url,
+        description: truncate(review.body),
+        color: 0x3498db,
+        timestamp: new Date().toISOString(),
+      },
+    ]);
   } else {
     console.log(`[review] Ignoring state "${review.state}" (no body or unhandled)`);
   }
@@ -299,14 +248,9 @@ async function handleReviewComment(payload) {
   if (action !== 'created') return;
 
   const commenter = getMention(sender.login);
-
-  await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${commenter} commented on a pull request`, [
+  await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${commenter} commented on a pull request`, [
     {
-      author: {
-        name: sender.login,
-        icon_url: sender.avatar_url,
-        url: `https://github.com/${sender.login}`,
-      },
+      author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
       title: `#${pr.number} ${pr.title}`,
       url: comment.html_url,
       description: truncate(comment.body),
@@ -322,14 +266,9 @@ async function handleIssueComment(payload) {
   if (action !== 'created') return;
 
   const commenter = getMention(sender.login);
-
-  await sendDiscord(DISCORD_WEBHOOK_URL, '#pull-requests', `${commenter} commented on a pull request`, [
+  await sendDiscord(DISCORD_PR_CHANNEL_ID, '#pull-requests', `${commenter} commented on a pull request`, [
     {
-      author: {
-        name: sender.login,
-        icon_url: sender.avatar_url,
-        url: `https://github.com/${sender.login}`,
-      },
+      author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
       title: `#${issue.number} ${issue.title}`,
       url: comment.html_url,
       description: truncate(comment.body),
@@ -347,20 +286,14 @@ async function handleIssue(payload) {
   const assigneeMention = getMention(assignee.login);
   const actor = getMention(sender.login);
 
-  await sendDiscord(DISCORD_ISSUES_WEBHOOK_URL, '#issues', `${actor} assigned ${assigneeMention} to an issue`, [
+  await sendDiscord(DISCORD_ISSUES_CHANNEL_ID, '#issues', `${actor} assigned ${assigneeMention} to an issue`, [
     {
-      author: {
-        name: sender.login,
-        icon_url: sender.avatar_url,
-        url: `https://github.com/${sender.login}`,
-      },
+      author: { name: sender.login, icon_url: sender.avatar_url, url: `https://github.com/${sender.login}` },
       title: `#${issue.number} ${issue.title}`,
       url: issue.html_url,
       description: truncate(issue.body),
       color: 0xe67e22,
-      fields: labelList(issue)
-        ? [{ name: 'Labels', value: labelList(issue), inline: true }]
-        : [],
+      fields: labelList(issue) ? [{ name: 'Labels', value: labelList(issue), inline: true }] : [],
       timestamp: new Date().toISOString(),
     },
   ]);
@@ -378,24 +311,22 @@ app.post('/github', async (req, res) => {
   const action = req.body?.action;
   console.log(`[webhook] Received event="${event}" action="${action}"`);
 
-  const payload = req.body;
-
-  // Respond to GitHub immediately so it doesn't time out or retry
+  // Respond to GitHub immediately so it doesn't time out
   res.status(200).send('OK');
 
   // Process asynchronously in the background
   (async () => {
     try {
       if (event === 'issues') {
-        await handleIssue(payload);
+        await handleIssue(req.body);
       } else if (event === 'pull_request') {
-        await handlePullRequest(payload);
+        await handlePullRequest(req.body);
       } else if (event === 'pull_request_review') {
-        await handlePullRequestReview(payload);
+        await handlePullRequestReview(req.body);
       } else if (event === 'pull_request_review_comment') {
-        await handleReviewComment(payload);
-      } else if (event === 'issue_comment' && payload.issue?.pull_request) {
-        await handleIssueComment(payload);
+        await handleReviewComment(req.body);
+      } else if (event === 'issue_comment' && req.body.issue?.pull_request) {
+        await handleIssueComment(req.body);
       } else {
         console.log(`[webhook] No handler for event="${event}" action="${action}" — ignoring`);
       }
