@@ -91,7 +91,8 @@ async function sendDiscord(webhookUrl, channelLabel, content, embeds = [], retri
   } catch (err) {
     if (err.response?.status === 429 && retries > 0) {
       const retryAfter = (err.response.data?.retry_after ?? 1) * 1000;
-      console.warn(`[discord] Rate limited by ${channelLabel}, retrying in ${retryAfter}ms... (${retries} retries left)`);
+      console.warn(`[discord] Rate limited by ${channelLabel} — full response: ${JSON.stringify(err.response.data)}`);
+      console.warn(`[discord] Retrying in ${retryAfter}ms... (${retries} retries left)`);
       await new Promise((r) => setTimeout(r, retryAfter));
       return sendDiscord(webhookUrl, channelLabel, content, embeds, retries - 1);
     }
